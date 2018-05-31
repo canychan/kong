@@ -57,7 +57,6 @@ local ngx_balancer = require "ngx.balancer"
 local plugins_iterator = require "kong.runloop.plugins_iterator"
 local balancer_execute = require("kong.runloop.balancer").execute
 local kong_cluster_events = require "kong.cluster_events"
-local kong_error_handlers = require "kong.error_handlers"
 
 local ngx              = ngx
 local header           = ngx.header
@@ -392,9 +391,9 @@ end
 function Kong.access()
   local ctx = ngx.ctx
 
-  runloop.access.before(ctx)
-
   ctx.delay_response = true
+
+  runloop.access.before(ctx)
 
   for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins, true) do
     if not ctx.delayed_response then
@@ -428,6 +427,8 @@ end
 
 function Kong.body_filter()
   local ctx = ngx.ctx
+  runloop.body_filter.before(ctx)
+
   for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins) do
     plugin.handler:body_filter(plugin_conf)
   end
@@ -442,10 +443,6 @@ function Kong.log()
   end
 
   runloop.log.after(ctx)
-end
-
-function Kong.handle_error()
-  return kong_error_handlers(ngx)
 end
 
 function Kong.serve_admin_api(options)

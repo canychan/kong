@@ -68,8 +68,6 @@ server {
 > for i = 1, #proxy_listeners do
     listen $(proxy_listeners[i].listener);
 > end
-    error_page 400 404 408 411 412 413 414 417 494 /kong_error_handler;
-    error_page 500 502 503 504 /kong_error_handler;
 
     access_log ${{PROXY_ACCESS_LOG}};
     error_log ${{PROXY_ERROR_LOG}} ${{LOG_LEVEL}};
@@ -101,7 +99,17 @@ server {
     set_real_ip_from   $(trusted_ips[i]);
 > end
 
+    rewrite_by_lua_block {
+        kong.rewrite()
+    }
+
+    access_by_lua_block {
+        kong.access()
+    }
+
     location / {
+        default_type                     '';
+
         set $upstream_host               '';
         set $upstream_upgrade            '';
         set $upstream_connection         '';
@@ -111,14 +119,6 @@ server {
         set $upstream_x_forwarded_proto  '';
         set $upstream_x_forwarded_host   '';
         set $upstream_x_forwarded_port   '';
-
-        rewrite_by_lua_block {
-            kong.rewrite()
-        }
-
-        access_by_lua_block {
-            kong.access()
-        }
 
         proxy_http_version 1.1;
         proxy_set_header   Host              $upstream_host;
@@ -133,25 +133,18 @@ server {
         proxy_pass_header  Date;
         proxy_ssl_name     $upstream_host;
         proxy_pass         $upstream_scheme://kong_upstream$upstream_uri;
-
-        header_filter_by_lua_block {
-            kong.header_filter()
-        }
-
-        body_filter_by_lua_block {
-            kong.body_filter()
-        }
-
-        log_by_lua_block {
-            kong.log()
-        }
     }
 
-    location = /kong_error_handler {
-        internal;
-        content_by_lua_block {
-            kong.handle_error()
-        }
+    header_filter_by_lua_block {
+        kong.header_filter()
+    }
+
+    body_filter_by_lua_block {
+        kong.body_filter()
+    }
+
+    log_by_lua_block {
+        kong.log()
     }
 }
 > end

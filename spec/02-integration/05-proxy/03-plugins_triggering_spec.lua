@@ -1,7 +1,12 @@
 local helpers = require "spec.helpers"
+local utils = require "kong.tools.utils"
+local cjson = require "cjson"
+local pl_path = require "pl.path"
+local pl_file = require "pl.file"
+local pl_stringx = require "pl.stringx"
 
 
-for _, strategy in helpers.each_strategy() do
+for _, strategy in helpers.each_strategy("postgres") do
 
   describe("Plugins triggering [#" .. strategy .. "]", function()
     local proxy_client
@@ -311,12 +316,6 @@ for _, strategy in helpers.each_strategy() do
       end)
 
       it("execute a log plugin", function()
-        local utils = require "kong.tools.utils"
-        local cjson = require "cjson"
-        local pl_path = require "pl.path"
-        local pl_file = require "pl.file"
-        local pl_stringx = require "pl.stringx"
-
         local uuid = utils.uuid()
 
         local res = assert(proxy_client:send {
@@ -379,11 +378,6 @@ for _, strategy in helpers.each_strategy() do
 
       -- regression test for bug spotted in 0.12.0rc2
       it("responses.send stops plugin but runloop continues", function()
-        local utils = require "kong.tools.utils"
-        local cjson = require "cjson"
-        local pl_path = require "pl.path"
-        local pl_file = require "pl.file"
-        local pl_stringx = require "pl.stringx"
         local uuid = utils.uuid()
 
         local res = assert(proxy_client:send {
@@ -504,6 +498,179 @@ for _, strategy in helpers.each_strategy() do
           },
         })
         assert.res_status(200, res)
+      end)
+    end)
+
+    describe("proxy-intercepted error", function()
+      local FILE_LOG_PATH = os.tmpname()
+
+      setup(function()
+        assert(db:truncate())
+        dao:truncate_tables()
+
+        local httpbin_service = bp.services:insert {
+          name            = "timeout",
+          host            = "httpbin.org",
+          connect_timeout = 1, -- ms
+        }
+
+        bp.routes:insert {
+          hosts     = { "connect_timeout" },
+          protocols = { "http" },
+          service   = httpbin_service,
+        }
+
+        bp.plugins:insert {
+          name = "file-log",
+          service_id = httpbin_service.id,
+          config = {
+            path = FILE_LOG_PATH,
+          }
+        }
+
+        local mock_service = bp.services:insert {
+          name = "unavailable",
+        }
+
+        bp.routes:insert {
+          hosts     = { "unavailable" },
+          protocols = { "http" },
+          service   = mock_service,
+        }
+
+        bp.plugins:insert {
+          name = "file-log",
+          service_id = mock_service.id,
+          config = {
+            path = FILE_LOG_PATH,
+          }
+        }
+
+        -- start mock httpbin instance
+        assert(helpers.start_kong {
+          database = strategy,
+          admin_listen = "127.0.0.1:9011",
+          proxy_listen = "127.0.0.1:9010",
+          proxy_listen_ssl = "127.0.0.1:9453",
+          admin_listen_ssl = "127.0.0.1:9454",
+          prefix = "servroot2",
+          nginx_conf = "spec/fixtures/custom_nginx.template",
+        })
+
+        -- start Kong instance
+        assert(helpers.start_kong {
+          database = strategy,
+          -- test with real nginx config
+        })
+
+        proxy_client = helpers.proxy_client()
+      end)
+
+      teardown(function()
+        if proxy_client then
+          proxy_client:close()
+        end
+
+        os.remove(FILE_LOG_PATH)
+        helpers.stop_kong()
+        helpers.stop_kong("servroot2")
+      end)
+
+      after_each(function()
+        os.execute("echo '' > " .. FILE_LOG_PATH)
+      end)
+
+      it("executes a log plugin on Gateway Timeout", function()
+        local uuid = utils.uuid()
+
+        local res = assert(proxy_client:send {
+          method = "GET",
+          path = "/status/200",
+          headers = {
+            ["Host"] = "connect_timeout",
+            ["X-UUID"] = uuid,
+          }
+        })
+        assert.res_status(504, res) -- Gateway Timeout
+
+        -- TEST: ensure that our logging plugin was executed and wrote
+        -- something to disk.
+
+        helpers.wait_until(function()
+          return pl_path.exists(FILE_LOG_PATH)
+                 and pl_path.getsize(FILE_LOG_PATH) > 0
+        end, 3)
+
+        local log = pl_file.read(FILE_LOG_PATH)
+        local log_message = cjson.decode(pl_stringx.strip(log))
+        assert.equal("127.0.0.1", log_message.client_ip)
+        assert.equal(uuid, log_message.request.headers["x-uuid"])
+      end)
+
+      it("executes a log plugin on Service Unavailable", function()
+        -- without proxy_intercept_on, no risk for this to not go through
+        -- Kong's usual runloop.
+        local uuid = utils.uuid()
+
+        local res = assert(proxy_client:send {
+          method = "GET",
+          path = "/status/503",
+          headers = {
+            ["Host"] = "unavailable",
+            ["X-UUID"] = uuid,
+          }
+        })
+        assert.res_status(503, res) -- Service Unavailable
+
+        -- TEST: ensure that our logging plugin was executed and wrote
+        -- something to disk.
+
+        helpers.wait_until(function()
+          return pl_path.exists(FILE_LOG_PATH)
+                 and pl_path.getsize(FILE_LOG_PATH) > 0
+        end, 3)
+
+        local log = pl_file.read(FILE_LOG_PATH)
+        local log_message = cjson.decode(pl_stringx.strip(log))
+        assert.equal("127.0.0.1", log_message.client_ip)
+        assert.equal(uuid, log_message.request.headers["x-uuid"])
+      end)
+
+      it("#o log plugins sees same request in error filter", function()
+        -- without proxy_intercept_on, no risk for this to not go through
+        -- Kong's usual runloop.
+        local uuid = utils.uuid()
+
+        local res = assert(proxy_client:send {
+          method = "POST",
+          path = "/status/503?foo=bar",
+          headers = {
+            ["Host"] = "unavailable",
+            ["X-UUID"] = uuid,
+            ["Content-Type"] = "application/json",
+          },
+          body = {
+            hello = "world",
+          }
+        })
+        assert.res_status(503, res) -- Service Unavailable
+
+        -- TEST: ensure that our logging plugin was executed and wrote
+        -- something to disk.
+
+        helpers.wait_until(function()
+          return pl_path.exists(FILE_LOG_PATH)
+            and pl_path.getsize(FILE_LOG_PATH) > 0
+        end, 3)
+
+        local log = pl_file.read(FILE_LOG_PATH)
+        local log_message = cjson.decode(pl_stringx.strip(log))
+
+        --local ins = require "inspect"
+        --print(ins(log_message))
+
+        assert.equal(uuid, log_message.request.headers["x-uuid"])
+        assert.equal("POST", log_message.request.method)
       end)
     end)
   end)
